@@ -27,11 +27,11 @@ sudo ufw deny 143/tcp   # IMAP
 sudo ufw deny 993/tcp   # IMAPS
 
 # Block database-related ports (MySQL, PostgreSQL, etc.)
-sudo ufw deny 3306/tcp  # MySQL
-sudo ufw deny 5432/tcp  # PostgreSQL
-sudo ufw deny 27017/tcp # MongoDB
-sudo ufw deny 6379/tcp  # Redis
-sudo ufw deny 11211/tcp # Memcached
+#sudo ufw deny 3306/tcp  # MySQL
+#sudo ufw deny 5432/tcp  # PostgreSQL
+#sudo ufw deny 27017/tcp # MongoDB
+#sudo ufw deny 6379/tcp  # Redis
+#sudo ufw deny 11211/tcp # Memcached
 
 # Block old/unsafe ports (Telnet, TFTP, etc.)
 sudo ufw deny 23/tcp    # Telnet
@@ -39,13 +39,13 @@ sudo ufw deny 69/udp    # TFTP
 sudo ufw deny 111/tcp   # RPC Portmapper
 sudo ufw deny 515/tcp   # LPD Printer
 sudo ufw deny 161/162/udp # SNMP
-sudo ufw deny 5900/tcp  # VNC
+#sudo ufw deny 5900/tcp  # VNC
 
 # Block file-sharing ports (FTP, SMB, NFS)
 sudo ufw deny 21/tcp    # FTP
 sudo ufw deny 139/tcp   # SMB
 sudo ufw deny 445/tcp   # SMB
-sudo ufw deny 2049/tcp  # NFS
+#sudo ufw deny 2049/tcp  # NFS
 
 # Enable UFW with the new rules
 echo "Enabling UFW..."
