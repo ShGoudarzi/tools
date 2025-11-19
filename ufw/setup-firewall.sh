@@ -3,7 +3,7 @@
 # Update the system
 echo "Updating system..."
 sudo apt update -y
-sudo apt upgrade -y
+#sudo apt upgrade -y
 
 # Install UFW (if not installed)
 echo "Installing UFW..."
