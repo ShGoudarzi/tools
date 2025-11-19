@@ -25,8 +25,8 @@ This script is designed to configure the firewall on an Ubuntu server using `UFW
 1. **Clone the repository** or **download the script**:
 
     ```bash
-    git clone https://github.com/ShGoudarzi/firewall-setup.git
-    cd firewall-setup
+    git clone https://github.com/ShGoudarzi/tools.git
+    cd tools/ufw
     ```
 
 2. **Make the script executable**:
