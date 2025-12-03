@@ -9,7 +9,10 @@ ARCHES="amd64"               # Architectures to mirror (e.g. "amd64 i386")
 BASE_PATH="/var/spool/apt-mirror"
 REPO_ROOT="/srv/repo"
 SERVER_NAME="repo.local"     # DNS name or /etc/hosts entry for mirror server
-ENABLE_GITLAB_CE="yes"       # Set to "no" if you don't want to mirror GitLab CE
+
+ENABLE_DOCKER="yes"          # Mirror Docker APT repo by default
+ENABLE_GITLAB_CE="yes"       # Mirror GitLab CE APT repo by default
+
 SYNC_HOUR="02"               # Daily sync hour (0–23)
 SYNC_MIN="00"                # Daily sync minute (0–59)
 ########################################
@@ -41,26 +44,25 @@ set arch         ${ARCHES}
 EOF
 
 ########################################
-# 2) Default Ubuntu focal repo fragment
+# 2) Default Docker repo fragment
 ########################################
-UBUNTU_FRAGMENT="/etc/repo-mirror/sources.d/ubuntu-${CODENAME}.list"
-if [[ ! -f "${UBUNTU_FRAGMENT}" ]]; then
-  echo "[*] Creating default Ubuntu fragment: ${UBUNTU_FRAGMENT}"
-  cat > "${UBUNTU_FRAGMENT}" <<EOF
-############# Ubuntu ${CODENAME} #############
-deb http://archive.ubuntu.com/ubuntu ${CODENAME} main restricted universe multiverse
-deb http://archive.ubuntu.com/ubuntu ${CODENAME}-updates main restricted universe multiverse
-deb http://security.ubuntu.com/ubuntu ${CODENAME}-security main restricted universe multiverse
+if [[ "${ENABLE_DOCKER}" == "yes" ]]; then
+  DOCKER_FRAGMENT="/etc/repo-mirror/sources.d/docker-${CODENAME}.list"
+  if [[ ! -f "${DOCKER_FRAGMENT}" ]]; then
+    echo "[*] Creating default Docker fragment: ${DOCKER_FRAGMENT}"
+    cat > "${DOCKER_FRAGMENT}" <<EOF
+############# Docker Ubuntu Repo #############
+deb https://download.docker.com/linux/ubuntu ${CODENAME} stable
 
-clean http://archive.ubuntu.com/ubuntu
-clean http://security.ubuntu.com/ubuntu
+clean https://download.docker.com/linux/ubuntu
 EOF
-else
-  echo "[*] Ubuntu fragment already exists, skipping."
+  else
+    echo "[*] Docker fragment already exists, skipping."
+  fi
 fi
 
 ########################################
-# 3) Optional GitLab CE repo fragment
+# 3) Default GitLab CE repo fragment
 ########################################
 if [[ "${ENABLE_GITLAB_CE}" == "yes" ]]; then
   GITLAB_FRAGMENT="/etc/repo-mirror/sources.d/gitlab-ce-${CODENAME}.list"
@@ -78,24 +80,7 @@ EOF
 fi
 
 ########################################
-# 4) repos.conf mapping (symlink config)
-########################################
-echo "[*] Writing /etc/repo-mirror/repos.conf ..."
-cat > /etc/repo-mirror/repos.conf <<EOF
-# name            source_relative_path                                          web_path
-# -----------------------------------------------------------------------------------------------
-ubuntu           archive.ubuntu.com/ubuntu                                      ubuntu
-ubuntu-security  security.ubuntu.com/ubuntu                                     ubuntu-security
-EOF
-
-if [[ "${ENABLE_GITLAB_CE}" == "yes" ]]; then
-  cat >> /etc/repo-mirror/repos.conf <<EOF
-gitlab-ce        packages.gitlab.com/gitlab/gitlab-ce/ubuntu                    gitlab/gitlab-ce/ubuntu
-EOF
-fi
-
-########################################
-# 5) Generator script for /etc/apt/mirror.list
+# 4) Generator script for /etc/apt/mirror.list
 ########################################
 echo "[*] Creating /usr/local/bin/repo-mirror-generate-config.sh ..."
 cat > /usr/local/bin/repo-mirror-generate-config.sh <<'EOF'
@@ -127,54 +112,112 @@ EOF
 chmod +x /usr/local/bin/repo-mirror-generate-config.sh
 
 ########################################
-# 6) Script to build symlinks for Nginx
+# 5) Script to build symlinks for Nginx (auto from .list files)
 ########################################
 echo "[*] Creating /usr/local/bin/repo-mirror-build-links.sh ..."
-cat > /usr/local/bin/repo-mirror-build-links.sh <<EOF
+cat > /usr/local/bin/repo-mirror-build-links.sh <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 
+BASE_PATH="{{BASE_PATH}}"
+REPO_ROOT="{{REPO_ROOT}}"
+SOURCES_DIR="/etc/repo-mirror/sources.d"
+
 BASE_PATH="${BASE_PATH}"
 REPO_ROOT="${REPO_ROOT}"
-CONF="/etc/repo-mirror/repos.conf"
 
-mkdir -p "\${REPO_ROOT}"
+mkdir -p "${REPO_ROOT}"
 
-if [[ ! -f "\${CONF}" ]]; then
-  echo "[-] repos.conf not found: \${CONF}"
-  exit 1
-fi
+# For each .list fragment:
+# - derive a "name" from the filename (without extension)
+# - find the first "deb" line
+# - extract the upstream host from the URL
+# - create a symlink: ${REPO_ROOT}/${name} -> ${BASE_PATH}/mirror/${host}
+#
+# This means on clients you will use:
+#   deb http://repo.local/<name>/<rest-of-original-path> <distro> <components>
+#
+# Example:
+#   original:
+#     deb https://download.docker.com/linux/ubuntu focal stable
+#   mirror layout:
+#     ${BASE_PATH}/mirror/download.docker.com/linux/ubuntu
+#   symlink:
+#     ${REPO_ROOT}/docker-focal -> ${BASE_PATH}/mirror/download.docker.com
+#   client source:
+#     deb http://repo.local/docker-focal/linux/ubuntu focal stable
 
-while read -r name src_rel web_path; do
-  # Skip empty lines and comments
-  [[ -z "\${name:-}" ]] && continue
-  [[ "\${name}" =~ ^# ]] && continue
+for f in "${SOURCES_DIR}"/*.list; do
+  [[ -e "$f" ]] || continue
 
-  src="\${BASE_PATH}/mirror/\${src_rel}"
-  dest="\${REPO_ROOT}/\${web_path}"
+  fragment_name="$(basename "$f")"
+  name="${fragment_name%.list}"
 
-  if [[ ! -d "\${src}" ]]; then
-    echo "[repo-mirror] WARNING: source directory not found: \${src} (for \${name})"
+  # Find first 'deb' or 'deb-src' line
+  deb_line=""
+  while IFS= read -r line; do
+    # Trim leading spaces
+    trimmed="${line#"${line%%[![:space:]]*}"}"
+    case "$trimmed" in
+      deb\ *|deb-src\ *)
+        deb_line="$trimmed"
+        break
+        ;;
+    esac
+  done < "$f"
+
+  if [[ -z "${deb_line}" ]]; then
+    echo "[repo-mirror] WARNING: no 'deb' line found in ${f}, skipping."
     continue
   fi
 
-  mkdir -p "\$(dirname "\${dest}")"
+  # Split deb line to extract URL
+  # Format: deb [options] URL distro components...
+  set -- $deb_line
+  if [[ "$2" == \[*\] ]]; then
+    url="$3"
+  else
+    url="$2"
+  fi
 
-  if [[ -e "\${dest}" && ! -L "\${dest}" ]]; then
-    echo "[repo-mirror] WARNING: \${dest} exists and is not a symlink, skipping."
+  # Strip protocol
+  proto_removed="${url#*://}"
+  host="${proto_removed%%/*}"
+
+  if [[ -z "${host}" ]]; then
+    echo "[repo-mirror] WARNING: could not parse host from URL '${url}' in ${f}, skipping."
     continue
   fi
 
-  rm -f "\${dest}"
-  ln -s "\${src}" "\${dest}"
-  echo "[repo-mirror] Linked \${name}: \${dest} -> \${src}"
-done < "\${CONF}"
+  src="${BASE_PATH}/mirror/${host}"
+  dest="${REPO_ROOT}/${name}"
+
+  if [[ ! -d "${src}" ]]; then
+    echo "[repo-mirror] WARNING: source directory not found for ${name}: ${src}"
+    continue
+  fi
+
+  mkdir -p "$(dirname "${dest}")"
+
+  if [[ -e "${dest}" && ! -L "${dest}" ]]; then
+    echo "[repo-mirror] WARNING: ${dest} exists and is not a symlink, skipping."
+    continue
+  fi
+
+  rm -f "${dest}"
+  ln -s "${src}" "${dest}"
+  echo "[repo-mirror] Linked ${name}: ${dest} -> ${src}"
+done
 EOF
+
+# Inject BASE_PATH and REPO_ROOT into the script
+sed -i "s|{{BASE_PATH}}|${BASE_PATH}|g" /usr/local/bin/repo-mirror-build-links.sh
+sed -i "s|{{REPO_ROOT}}|${REPO_ROOT}|g" /usr/local/bin/repo-mirror-build-links.sh
 
 chmod +x /usr/local/bin/repo-mirror-build-links.sh
 
 ########################################
-# 7) Main sync script
+# 6) Main sync script
 ########################################
 echo "[*] Creating /usr/local/bin/apt-mirror-sync.sh ..."
 cat > /usr/local/bin/apt-mirror-sync.sh <<'EOF'
@@ -200,7 +243,7 @@ EOF
 chmod +x /usr/local/bin/apt-mirror-sync.sh
 
 ########################################
-# 8) Systemd service + timer
+# 7) Systemd service + timer
 ########################################
 echo "[*] Creating systemd service & timer..."
 
@@ -238,7 +281,7 @@ if [[ -f /etc/cron.d/apt-mirror ]]; then
 fi
 
 ########################################
-# 9) Nginx config
+# 8) Nginx config
 ########################################
 echo "[*] Creating Nginx site for repo..."
 
@@ -267,7 +310,7 @@ systemctl reload nginx
 systemctl enable nginx
 
 ########################################
-# 10) Initial sync (first run)
+# 9) Initial sync (first run)
 ########################################
 echo "[*] Running initial apt-mirror sync (this may take a long time)..."
 /usr/local/bin/apt-mirror-sync.sh
@@ -276,20 +319,22 @@ echo
 echo "==============================================="
 echo " Repo Mirror server setup finished."
 echo "-----------------------------------------------"
-echo " Mirror base path:   ${BASE_PATH}"
-echo " Web root:           ${REPO_ROOT}"
-echo " Nginx URL:          http://${SERVER_NAME}/"
-echo " Daily sync timer:   apt-mirror.timer at ${SYNC_HOUR}:${SYNC_MIN}"
-echo " Sync log file:      /var/log/apt-mirror-sync.log"
+echo " Base path:         ${BASE_PATH}"
+echo " Web root:          ${REPO_ROOT}"
+echo " Nginx URL:         http://${SERVER_NAME}/"
+echo " Daily sync timer:  apt-mirror.timer at ${SYNC_HOUR}:${SYNC_MIN}"
+echo " Sync log file:     /var/log/apt-mirror-sync.log"
 echo "==============================================="
 echo
-echo "Example client config (Ubuntu ${CODENAME}):"
-echo "  deb http://${SERVER_NAME}/ubuntu ${CODENAME} main restricted universe multiverse"
-echo "  deb http://${SERVER_NAME}/ubuntu ${CODENAME}-updates main restricted universe multiverse"
-echo "  deb http://${SERVER_NAME}/ubuntu-security ${CODENAME}-security main restricted universe multiverse"
+echo "Default mirrored repos (if enabled):"
+echo "  - Docker:     /etc/repo-mirror/sources.d/docker-${CODENAME}.list"
+echo "  - GitLab CE:  /etc/repo-mirror/sources.d/gitlab-ce-${CODENAME}.list"
 echo
-echo "If GitLab CE is enabled, client source:"
-echo "  deb http://${SERVER_NAME}/gitlab/gitlab-ce/ubuntu ${CODENAME} main"
+echo "On clients, you will typically use URLs like:"
+echo "  deb http://${SERVER_NAME}/docker-${CODENAME}/linux/ubuntu ${CODENAME} stable"
+echo "  deb http://${SERVER_NAME}/gitlab-ce-${CODENAME}/gitlab/gitlab-ce/ubuntu ${CODENAME} main"
 echo
-echo "To extend with new repos, see comments in /etc/repo-mirror/sources.d and /etc/repo-mirror/repos.conf"
+echo "To add new repos later, just drop a new .list file into /etc/repo-mirror/sources.d"
+echo "(no need to touch any other config), then run:"
+echo "  sudo systemctl start apt-mirror.service"
 echo
